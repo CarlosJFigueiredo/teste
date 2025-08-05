@@ -2,6 +2,7 @@ package com.dtidigital.drone_delivery.service;
 
 import java.util.*;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import com.dtidigital.drone_delivery.enums.EstadoDrone;
@@ -18,13 +19,25 @@ public class DroneService {
     private final List<Entrega> entregasRealizadas = new ArrayList<>();
     private final List<ZonaExclusao> zonasExclusao = new ArrayList<>();
     
+    private final SimuladorBateria simuladorBateria;
+    private final OtimizadorEntregas otimizadorEntregas;
+    
     // Configurações do sistema
     private static final double VELOCIDADE_DRONE_KM_H = 30.0; // 30 km/h
-    private static final double CONSUMO_BATERIA_POR_KM = 0.5; // 0.5 unidade de bateria por km (mais eficiente)
     private static final double BATERIA_MINIMA_RETORNO = 5.0; // 5% da bateria para retorno seguro
 
-    public DroneService() {
+    @Autowired
+    public DroneService(SimuladorBateria simuladorBateria, OtimizadorEntregas otimizadorEntregas) {
+        this.simuladorBateria = simuladorBateria;
+        this.otimizadorEntregas = otimizadorEntregas;
         // Inicializar zonas de exclusão padrão
+        inicializarZonasExclusao();
+    }
+
+    // Construtor para compatibilidade com testes
+    public DroneService() {
+        this.simuladorBateria = new SimuladorBateria();
+        this.otimizadorEntregas = new OtimizadorEntregas();
         inicializarZonasExclusao();
     }
 
@@ -56,48 +69,36 @@ public class DroneService {
     }
 
     public void simularEntrega() {
-        for (Drone drone : drones) {
-            if (drone.getEstado() == EstadoDrone.IDLE && !filaDePedidos.isEmpty()) {
-                alocarPedidosParaDrone(drone);
-            }
+        if (filaDePedidos.isEmpty()) {
+            return;
         }
-    }
-
-    private void alocarPedidosParaDrone(Drone drone) {
-        double pesoTotal = 0;
-        List<Pedido> alocados = new ArrayList<>();
-        List<Pedido> pedidosParaRemover = new ArrayList<>();
-
-        for (Pedido pedido : filaDePedidos) {
-            // Verificar se a rota passa por zona de exclusão
-            if (verificarZonaExclusao(0, 0, pedido.getX(), pedido.getY())) {
-                continue; // Pular este pedido
-            }
-
-            double distanciaIda = calcularDistancia(0, 0, pedido.getX(), pedido.getY());
-            double distanciaVolta = distanciaIda; // Assumindo volta direta à base
-            double distanciaTotal = distanciaIda + distanciaVolta;
+        
+        // Usar otimizador para melhor alocação de pedidos
+        List<Pedido> pedidosValidos = filaDePedidos.stream()
+            .filter(p -> !verificarZonaExclusao(0, 0, p.getX(), p.getY()))
+            .toList();
             
-            double bateriaMinimaNecessaria = distanciaTotal * CONSUMO_BATERIA_POR_KM + BATERIA_MINIMA_RETORNO;
-
-            if ((pesoTotal + pedido.getPeso() <= drone.getCapacidadeMaxima())
-                    && (bateriaMinimaNecessaria <= drone.getBateriaAtual())) {
-
-                pesoTotal += pedido.getPeso();
-                alocados.add(pedido);
-                pedidosParaRemover.add(pedido);
-                drone.adicionarPedido(pedido);
+        List<List<Pedido>> alocacoesOtimizadas = otimizadorEntregas.otimizarAlocacao(
+            drones.stream().filter(d -> d.getEstado() == EstadoDrone.IDLE).toList(),
+            new ArrayList<>(pedidosValidos)
+        );
+        
+        int index = 0;
+        for (Drone drone : drones) {
+            if (drone.getEstado() == EstadoDrone.IDLE && index < alocacoesOtimizadas.size()) {
+                List<Pedido> pedidosParaDrone = alocacoesOtimizadas.get(index);
+                if (!pedidosParaDrone.isEmpty()) {
+                    // Remover pedidos alocados da fila
+                    filaDePedidos.removeAll(pedidosParaDrone);
+                    // Executar entregas com simulação avançada
+                    executarEntregasAvancadas(drone, pedidosParaDrone);
+                }
+                index++;
             }
-        }
-
-        filaDePedidos.removeAll(pedidosParaRemover);
-
-        if (!alocados.isEmpty()) {
-            executarEntregas(drone, alocados);
         }
     }
 
-    private void executarEntregas(Drone drone, List<Pedido> pedidos) {
+    private void executarEntregasAvancadas(Drone drone, List<Pedido> pedidos) {
         drone.setEstado(EstadoDrone.CARREGANDO);
         
         // Simular tempo de carregamento
@@ -107,7 +108,10 @@ public class DroneService {
             Thread.currentThread().interrupt();
         }
 
-        for (Pedido pedido : pedidos) {
+        // Usar rota otimizada do OtimizadorEntregas
+        List<Pedido> rotaOtimizada = otimizadorEntregas.otimizarRota(pedidos);
+        
+        for (Pedido pedido : rotaOtimizada) {
             Entrega entrega = new Entrega(drone.getId(), pedido);
             
             drone.setEstado(EstadoDrone.EM_VOO);
@@ -115,7 +119,18 @@ public class DroneService {
             // Calcular tempo e distância
             double distancia = calcularDistancia(drone.getPosX(), drone.getPosY(), pedido.getX(), pedido.getY());
             double tempo = calcularTempo(distancia);
-            double bateriaConsumida = distancia * CONSUMO_BATERIA_POR_KM;
+            
+            // Usar simulador avançado de bateria
+            double pesoTotal = rotaOtimizada.stream().mapToDouble(Pedido::getPeso).sum();
+            boolean condicaoAdversa = Math.random() < 0.3; // 30% chance de condições adversas
+            double bateriaConsumida = simuladorBateria.calcularConsumoReal(distancia, pesoTotal, condicaoAdversa);
+            
+            // Verificar se há bateria suficiente para continuar
+            if (!simuladorBateria.bateriaSeguraParaMissao(drone.getBateriaAtual(), 
+                calcularDistancia(pedido.getX(), pedido.getY(), 0, 0) * 2, pesoTotal)) {
+                // Retornar à base para recarregar
+                break;
+            }
             
             // Consumir bateria e mover drone
             drone.consumirBateria(bateriaConsumida);
@@ -137,13 +152,13 @@ public class DroneService {
         // Retornar à base
         drone.setEstado(EstadoDrone.RETORNANDO);
         double distanciaRetorno = calcularDistancia(drone.getPosX(), drone.getPosY(), 0, 0);
-        double bateriaRetorno = distanciaRetorno * CONSUMO_BATERIA_POR_KM;
+        double bateriaRetorno = simuladorBateria.calcularConsumoReal(distanciaRetorno, 0, false);
         
         drone.consumirBateria(bateriaRetorno);
         drone.setPosicao(0, 0);
         drone.limparPedidos();
         
-        // Verificar se precisa recarregar apenas se a bateria estiver muito baixa
+        // Verificar se precisa recarregar
         if (drone.getBateriaAtual() < BATERIA_MINIMA_RETORNO) {
             drone.setEstado(EstadoDrone.CARREGANDO);
             drone.recarregar();
